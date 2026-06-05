@@ -1,0 +1,4 @@
+# Minimal requirements inferred from the project imports
+pika
+python-dotenv
+pyserial

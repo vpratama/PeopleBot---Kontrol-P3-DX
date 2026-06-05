@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# dotenv files
+.env
+
+# Visual Studio Code
+.vscode/
+
+# Logs and databases
+*.log
+*.sqlite3
