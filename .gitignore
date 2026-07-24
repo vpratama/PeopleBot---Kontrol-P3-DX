@@ -8,6 +8,10 @@ __pycache__/
 venv/
 ENV/
 env/
+P3DX/
+
+# Python cache
+__pycache__/
 
 # dotenv files
 .env
