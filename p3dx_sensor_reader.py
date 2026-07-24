@@ -89,7 +89,7 @@ def connect_rabbitmq():
         )
     )
     channel = connection.channel()
-    channel.queue_declare(queue=RABBITMQ_QUEUE_SENSOR, durable=True, auto_delete=True)
+    channel.queue_declare(queue=RABBITMQ_QUEUE_SENSOR, durable=True, auto_delete=False)
     print(f"[RABBITMQ] Terhubung ke {RABBITMQ_HOST}:{RABBITMQ_PORT} vhost={RABBITMQ_VHOST} queue={RABBITMQ_QUEUE_SENSOR}")
     return connection, channel
 

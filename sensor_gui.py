@@ -48,7 +48,7 @@ class SensorConsumerThread(threading.Thread):
             )
         )
         self.channel = self.connection.channel()
-        self.channel.queue_declare(queue=RABBITMQ_QUEUE_SENSOR, durable=True, auto_delete=True)
+        self.channel.queue_declare(queue=RABBITMQ_QUEUE_SENSOR, durable=True, auto_delete=False)
         print(f"[RABBITMQ] Terhubung ke {RABBITMQ_HOST}:{RABBITMQ_PORT} queue={RABBITMQ_QUEUE_SENSOR}")
 
     def run(self):

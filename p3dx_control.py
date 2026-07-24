@@ -168,7 +168,7 @@ def main():
                     )
                 )
                 channel = connection.channel()
-                channel.queue_declare(queue=rabbitmq_queue, durable=True, auto_delete=True)
+                channel.queue_declare(queue=rabbitmq_queue, durable=True, auto_delete=False)
                 
                 def callback(ch, method, properties, body):
                     nonlocal left_motor_vel, right_motor_vel

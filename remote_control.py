@@ -73,7 +73,7 @@ class RobotRemoteControl:
                 )
             )
             self.channel = self.connection.channel()
-            self.channel.queue_declare(queue=self.rabbitmq_queue, durable=True, auto_delete=True)
+            self.channel.queue_declare(queue=self.rabbitmq_queue, durable=True, auto_delete=False)
             print(f"Connected to RabbitMQ at {self.rabbitmq_host}:{self.rabbitmq_port} vhost={self.rabbitmq_vhost}")
         except Exception as e:
             print(f"Failed to connect to RabbitMQ: {e}")
