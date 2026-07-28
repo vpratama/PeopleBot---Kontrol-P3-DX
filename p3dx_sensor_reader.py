@@ -1,5 +1,6 @@
 
 import os
+import re
 import pika
 import serial
 import time
@@ -13,6 +14,7 @@ load_dotenv()
 # Ambil nilai dari file .env dengan fallback default jika tidak ada
 SERIAL_PORT = os.getenv('SERIAL_PORT', '/dev/ttyUSB0')
 SERIAL_BAUDRATE = int(os.getenv('SERIAL_BAUDRATE', '9600'))
+SENSOR_SIMULATION = os.getenv('SENSOR_SIMULATION', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
 
 # --- Konfigurasi RabbitMQ ---
 RABBITMQ_HOST = os.getenv('RABBITMQ_HOST', 'localhost')
@@ -40,20 +42,34 @@ def simulate_sonar_data():
     return data
 
 def parse_sip_packet(raw_data):
-    """Fungsi placeholder untuk parsing paket SIP (Serial Interface Protocol).
-    Dalam implementasi nyata, ini akan jauh lebih kompleks dan spesifik terhadap format SIP.
-    Untuk simulasi, kita asumsikan raw_data sudah berupa list integer jarak sonar.
+    """Parse data sensor mentah menjadi daftar nilai sonar yang konsisten.
+
+    Mendukung format CSV sederhana dan data serial yang mengandung noise tambahan,
+    seperti header, karakter non-numerik, atau garis baru.
     """
-    # Asumsi: raw_data adalah string yang berisi nilai-nilai sonar yang dipisahkan koma
-    # Contoh: "1234,2345,3456,4567,1234,2345,3456,4567\n"
     try:
-        sonar_values_str = raw_data.strip().split(',')
-        sonar_values_int = [int(s) for s in sonar_values_str]
-        if len(sonar_values_int) == NUM_SONAR_SENSORS:
-            return sonar_values_int
-        else:
-            print(f"[ERROR] Jumlah sensor tidak sesuai: {len(sonar_values_int)} ditemukan, {NUM_SONAR_SENSORS} diharapkan.")
+        if raw_data is None:
             return None
+        if isinstance(raw_data, (bytes, bytearray)):
+            raw_data = raw_data.decode('utf-8', errors='ignore')
+
+        text = str(raw_data).strip()
+        if not text:
+            return None
+
+        values = re.findall(r'-?\d+(?:\.\d+)?', text)
+        if not values:
+            print(f"[ERROR] Tidak ada angka yang ditemukan dalam data: {raw_data}")
+            return None
+
+        sonar_values = [int(float(value)) for value in values]
+        if len(sonar_values) > NUM_SONAR_SENSORS:
+            sonar_values = sonar_values[:NUM_SONAR_SENSORS]
+        elif len(sonar_values) < NUM_SONAR_SENSORS:
+            print(f"[WARN] Jumlah sensor tidak sesuai: {len(sonar_values)} ditemukan, {NUM_SONAR_SENSORS} diharapkan.")
+            return None
+
+        return sonar_values
     except ValueError:
         print(f"[ERROR] Gagal parsing data: {raw_data}")
         return None
@@ -113,32 +129,35 @@ def main():
     print(f"Mencoba membuka port serial: {SERIAL_PORT} dengan baud rate: {SERIAL_BAUDRATE}")
     connection = None
     channel = None
+    ser = None
 
     try:
         connection, channel = connect_rabbitmq()
 
-        # Untuk simulasi, kita tidak benar-benar membuka port serial fisik.
-        # Jika Anda memiliki robot, uncomment baris di bawah ini dan comment bagian simulasi.
-        # ser = serial.Serial(SERIAL_PORT, SERIAL_BAUDRATE, timeout=1)
-        # print("Port serial berhasil dibuka.")
+        if not SENSOR_SIMULATION:
+            ser = serial.Serial(SERIAL_PORT, SERIAL_BAUDRATE, timeout=1)
+            print(f"[SERIAL] Port serial berhasil dibuka: {SERIAL_PORT}")
 
         while True:
-            # --- Bagian Simulasi (Ganti dengan pembacaan serial nyata jika terhubung ke robot) ---
-            simulated_raw_data = ','.join(map(str, simulate_sonar_data())) + '\n'
-            print(f"[SIMULASI] Menerima data mentah: {simulated_raw_data.strip()}")
+            if SENSOR_SIMULATION:
+                simulated_raw_data = ','.join(map(str, simulate_sonar_data())) + '\n'
+                print(f"[SIMULASI] Menerima data mentah: {simulated_raw_data.strip()}")
+                raw_data = simulated_raw_data
+            else:
+                if ser is None or not ser.is_open:
+                    raise serial.SerialException(f"Port serial {SERIAL_PORT} tidak tersedia")
+                raw_data = ser.readline()
+                if raw_data:
+                    raw_data = raw_data.decode('utf-8', errors='ignore')
+                    print(f"[SERIAL] Menerima data mentah: {raw_data.strip()}")
+                else:
+                    print("[SERIAL] Menunggu data dari robot...")
+                    continue
 
-            # Dalam skenario nyata, Anda akan membaca dari serial port seperti ini:
-            # raw_data = ser.readline().decode('utf-8') # Sesuaikan decoding jika perlu
-            # if raw_data:
-            #     sonar_readings = parse_sip_packet(raw_data)
-            #     display_sonar_data(sonar_readings)
-            # else:
-            #     print("Menunggu data dari robot...")
-
-            sonar_readings = parse_sip_packet(simulated_raw_data)
-            display_sonar_data(sonar_readings)
-            publish_sensor_data(channel, sonar_readings)
-
+            sonar_readings = parse_sip_packet(raw_data)
+            if sonar_readings is not None:
+                display_sonar_data(sonar_readings)
+                publish_sensor_data(channel, sonar_readings)
             time.sleep(1) # Tunggu 1 detik sebelum pembacaan berikutnya
 
     except serial.SerialException as e:
@@ -154,10 +173,9 @@ def main():
             connection.close()
             print("[RABBITMQ] Koneksi ditutup.")
 
-        # Jika menggunakan serial port nyata, pastikan untuk menutupnya
-        # if 'ser' in locals() and ser.is_open:
-        #     ser.close()
-        #     print("Port serial ditutup.")
+        if ser is not None and ser.is_open:
+            ser.close()
+            print("[SERIAL] Port serial ditutup.")
 
 if __name__ == "__main__":
     main()
