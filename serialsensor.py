@@ -1,110 +1,108 @@
 # -*- coding: utf-8 -*-
-from __future__ import print_function
-import os
-import sys
+import serial
 import time
-import ctypes
+import struct
 
-# === LOAD .env pakai python-dotenv ===
-from dotenv import load_dotenv
+# Tentukan port serial sesuai konfigurasi Anda
+SERIAL_PORT = 'COM5' 
+BAUD_RATE = 9600  # Baud rate default untuk P3DX/ARCOS
 
-# Load file .env yang ada di folder yang sama dengan script ini
-base_dir = os.path.dirname(os.path.abspath(__file__))
-dotenv_path = os.path.join(base_dir, ".env")
-load_dotenv(dotenv_path)
+def calculate_checksum(data):
+    """Menghitung checksum 2-byte standar ARCOS (Kompatibel Python 2.7)."""
+    c = 0
+    i = 0
+    length = len(data)
+    while i < length - 1:
+        c += (ord(data[i]) << 8) | ord(data[i+1])
+        c = c & 0xFFFF
+        i += 2
+    if i < length:
+        c += ord(data[i]) << 8
+        c = c & 0xFFFF
+    return struct.pack('>H', c)
 
-# Ambil konfigurasi dari .env dengan fallback ke path default
-SERIAL_PORT = os.getenv("SERIAL_PORT", "COM5")
-ARIA_BIN = os.getenv("ARIA_BIN", r"C:\Program Files\MobileRobots\Aria\bin")
-ARIA_PYTHON = os.getenv("ARIA_PYTHON", r"C:\Program Files\MobileRobots\Aria\python")
+def build_packet(cmd, arg):
+    """Membangun paket biner ARCOS menggunakan string biner Python 2.7."""
+    packet_body = chr(cmd) + chr(0x3B) + chr(arg & 0xFF) + chr((arg >> 8) & 0xFF)
+    byte_count = len(packet_body) + 2 
+    header = chr(0xFA) + chr(0xFB) + chr(byte_count)
+    full_payload = packet_body
+    checksum = calculate_checksum(full_payload)
+    return header + full_payload + checksum
 
-# === FIX UNTUK DLL & PATH (Tanpa ubah System Environment Variable Windows) ===
-# 1. Tambahkan path ke sys.path
-if ARIA_PYTHON not in sys.path:
-    sys.path.append(ARIA_PYTHON)
-if ARIA_BIN not in sys.path:
-    sys.path.append(ARIA_BIN)
+def parse_sonar_data(packet_body):
+    """
+    Memparsing paket data untuk mengambil nilai sensor sonar.
+    Format SIP Standar ARCOS/P2OS:
+    - Byte 0: ID Paket (Biasanya 0x32 atau 0x5C untuk baris sonar tambahan)
+    - Pada SIP standar (0x32), jumlah membaca sonar ada di byte urutan ke-23.
+    """
+    if len(packet_body) < 3:
+        return
 
-# 2. Update PATH lingkungan eksekusi Python lokal
-if ARIA_BIN not in os.environ.get('PATH', ''):
-    os.environ['PATH'] = ARIA_BIN + os.pathsep + os.environ.get('PATH', '')
-
-# 3. Muat DLL secara eksplisit via ctypes & pindah CWD sementara agar Windows menemukan C++ dependencies
-original_cwd = os.getcwd()
-try:
-    if os.path.exists(ARIA_BIN):
-        os.chdir(ARIA_BIN)
-        
-    aria_dll = os.path.join(ARIA_BIN, "Aria.dll")
-    if os.path.exists(aria_dll):
-        ctypes.CDLL(aria_dll)
+    packet_type = ord(packet_body[0])
     
-    # 4. Import AriaPy saat berada di direktori DLL
-    import AriaPy
+    # 1. SIP Standar (0x32) umumnya membawa data sonar utama (sampai 16 sonar)
+    if packet_type == 0x32:
+        # Offset standar ARCOS: Jumlah sonar berada di byte indeks ke-23
+        if len(packet_body) > 23:
+            num_sonars = ord(packet_body[23])
+            
+            if num_sonars > 0:
+                print("\n--- DATA SENSOR SONAR ---")
+                # Data sonar dimulai dari byte indeks ke-24
+                # Tiap sonar berukuran 3 byte: 1 byte nomor sensor, 2 byte nilai jarak (Little Endian)
+                current_idx = 24
+                
+                for s in range(num_sonars):
+                    if current_idx + 3 <= len(packet_body):
+                        sonar_id = ord(packet_body[current_idx])
+                        # Membaca nilai jarak 2 byte integer (Little Endian)
+                        distance = ord(packet_body[current_idx+1]) | (ord(packet_body[current_idx+2]) << 8)
+                        
+                        print("Sonar #%d: %d mm" % (sonar_id, distance))
+                        current_idx += 3
+                print("-------------------------")
+
+try:
+    # 1. Membuka koneksi serial
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    print("Terhubung ke robot pada port", SERIAL_PORT)
+    time.sleep(1) 
+
+    # 2. Kirim perintah OPEN (Command #1) untuk memulai sesi komunikasi
+    open_packet = build_packet(1, 0)
+    ser.write(open_packet)
+    print("Sesi komunikasi dibuka (Command OPEN dikirim).")
+    time.sleep(0.5)
+
+    # 3. Kirim perintah SONAR Enable (Command #28, Argumen = 1)
+    sonar_enable_packet = build_packet(28, 1)
+    ser.write(sonar_enable_packet)
+    print("Perintah aktivasi SONAR berhasil dikirim!")
+
+    # 4. Membaca data SIP (Server Information Packet) secara berkala
+    print("Membaca aliran data sensor (Tekan Ctrl+C untuk berhenti)...")
+    while True:
+        if ser.in_waiting > 0:
+            header = ser.read(2)
+            if header == '\xfa\xfb':
+                length = ord(ser.read(1))
+                packet_data = ser.read(length)
+                
+                # Panggil fungsi parsing untuk mengekstrak data sonar
+                parse_sonar_data(packet_data)
+                
+        time.sleep(0.05) # Mengurangi delay ke 50ms agar pembacaan lebih responsif
+
+except serial.SerialException as e:
+    print("Gagal membuka atau berkomunikasi dengan port serial:", e)
+except KeyboardInterrupt:
+    print("\nKomunikasi dihentikan oleh pengguna.")
 finally:
-    # Kembalikan Current Working Directory ke folder asal project
-    os.chdir(original_cwd)
-
-if hasattr(AriaPy, '__doc__') and AriaPy.__doc__:
-    print(AriaPy.__doc__)
-
-
-def read_aria_sensors(port=None):
-    """
-    Membaca data sensor dari PeopleBot P3-DX.
-    Support Python 2.7 dan 3.x
-    """
-    if port is None:
-        port = os.getenv("SERIAL_PORT", "COM5")
-
-    AriaPy.Aria.init()
-    robot = AriaPy.ArRobot()
-
-    parser = AriaPy.ArArgumentParser(sys.argv)
-    parser.addDefaultArgument("-rp %s" % port)
-
-    if not AriaPy.Aria.parseArgs():
-        AriaPy.Aria.logOptions()
-        AriaPy.Aria.exit(1)
-
-    sonar = AriaPy.ArSonarDevice()
-    robot.addRangeDevice(sonar)
-
-    conn = AriaPy.ArRobotConnector(parser, robot)
-    if not conn.connectRobot():
-        print("Error: Tidak dapat terhubung ke robot di port %s." % port)
-        print("Cek .env SERIAL_PORT=%s" % port)
-        AriaPy.Aria.logOptions()
-        AriaPy.Aria.exit(1)
-
-    robot.runAsync(True)
-
-    print("Terhubung ke robot di port %s. Membaca sensor..." % port)
-    print("Tekan Ctrl+C untuk berhenti.")
-    try:
-        while True:
-            sensor_values_mm = []
-            for i in range(8):
-                sensor_values_mm.append(int(robot.getSonarRange(i)))
-
-            formatted_output = ",".join([str(v) for v in sensor_values_mm])
-            print("Pembacaan Sensor (mm): %s" % formatted_output)
-            time.sleep(0.1)
-
-    except KeyboardInterrupt:
-        print("\nProgram dihentikan oleh pengguna.")
-    except Exception as e:
-        print("Terjadi kesalahan: %s" % str(e))
-    finally:
-        print("Memutuskan koneksi...")
-        robot.stopRunning()
-        robot.waitForRunExit()
-        AriaPy.Aria.exit(0)
-
-
-if __name__ == "__main__":
-    print("Menggunakan SERIAL_PORT : %s" % SERIAL_PORT)
-    print("Menggunakan ARIA_BIN    : %s" % ARIA_BIN)
-    print("Menggunakan ARIA_PYTHON : %s" % ARIA_PYTHON)
-    print("-" * 50)
-    read_aria_sensors(port=SERIAL_PORT)
+    if 'ser' in locals() and ser.is_open:
+        # Kirim perintah CLOSE sebelum memutus port serial
+        close_packet = build_packet(2, 0)
+        ser.write(close_packet)
+        ser.close()
+        print("Port serial ditutup dengan aman.")
