@@ -3,7 +3,7 @@ setlocal
 :: === KONFIGURASI ===
 set VENV_DIR=.venv
 set WHEELS_DIR=.\wheels
-set PYTHON27_PATH=C:\Python27\python.exe
+set PYTHON27_PATH=C:\Python27-32\python.exe
 
 echo [1/6] Menghapus existing venv dan wheels folder...
 if exist %VENV_DIR% (

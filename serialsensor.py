@@ -3,41 +3,51 @@ from __future__ import print_function
 import os
 import sys
 import time
+import ctypes
 
 # === LOAD .env pakai python-dotenv ===
 from dotenv import load_dotenv
 
 # Load file .env yang ada di folder yang sama dengan script ini
-# override=False biar tidak menimpa env yang sudah ada
 base_dir = os.path.dirname(os.path.abspath(__file__))
 dotenv_path = os.path.join(base_dir, ".env")
 load_dotenv(dotenv_path)
 
-# Ambil SERIAL_PORT dari .env, default COM5
+# Ambil konfigurasi dari .env dengan fallback ke path default
 SERIAL_PORT = os.getenv("SERIAL_PORT", "COM5")
+ARIA_BIN = os.getenv("ARIA_BIN", r"C:\Program Files\MobileRobots\Aria\bin")
+ARIA_PYTHON = os.getenv("ARIA_PYTHON", r"C:\Program Files\MobileRobots\Aria\python")
 
-# === FIX untuk Python 2.7 vs 3.8+ ===
-ARIA_BIN = r"C:\Program Files\MobileRobots\Aria\bin"
-ARIA_PYTHON = r"C:\Program Files\MobileRobots\Aria\python"
-
-if hasattr(os, 'add_dll_directory'):
-    os.add_dll_directory(ARIA_BIN)
-else:
-    if ARIA_BIN not in os.environ.get('PATH', ''):
-        os.environ['PATH'] = ARIA_BIN + os.pathsep + os.environ.get('PATH', '')
-
+# === FIX UNTUK DLL & PATH (Tanpa ubah System Environment Variable Windows) ===
+# 1. Tambahkan path ke sys.path
 if ARIA_PYTHON not in sys.path:
     sys.path.append(ARIA_PYTHON)
+if ARIA_BIN not in sys.path:
+    sys.path.append(ARIA_BIN)
 
+# 2. Update PATH lingkungan eksekusi Python lokal
+if ARIA_BIN not in os.environ.get('PATH', ''):
+    os.environ['PATH'] = ARIA_BIN + os.pathsep + os.environ.get('PATH', '')
+
+# 3. Muat DLL secara eksplisit via ctypes & pindah CWD sementara agar Windows menemukan C++ dependencies
+original_cwd = os.getcwd()
 try:
+    if os.path.exists(ARIA_BIN):
+        os.chdir(ARIA_BIN)
+        
+    aria_dll = os.path.join(ARIA_BIN, "Aria.dll")
+    if os.path.exists(aria_dll):
+        ctypes.CDLL(aria_dll)
+    
+    # 4. Import AriaPy saat berada di direktori DLL
     import AriaPy
-except ImportError as e:
-    print("GAGAL import AriaPy: %s" % e)
-    print("Pastikan path ini benar: %s" % ARIA_PYTHON)
-    sys.exit(1)
+finally:
+    # Kembalikan Current Working Directory ke folder asal project
+    os.chdir(original_cwd)
 
 if hasattr(AriaPy, '__doc__') and AriaPy.__doc__:
     print(AriaPy.__doc__)
+
 
 def read_aria_sensors(port=None):
     """
@@ -82,7 +92,7 @@ def read_aria_sensors(port=None):
             time.sleep(0.1)
 
     except KeyboardInterrupt:
-        print("Program dihentikan oleh pengguna.")
+        print("\nProgram dihentikan oleh pengguna.")
     except Exception as e:
         print("Terjadi kesalahan: %s" % str(e))
     finally:
@@ -91,6 +101,10 @@ def read_aria_sensors(port=None):
         robot.waitForRunExit()
         AriaPy.Aria.exit(0)
 
+
 if __name__ == "__main__":
-    print("Menggunakan SERIAL_PORT dari .env: %s" % SERIAL_PORT)
+    print("Menggunakan SERIAL_PORT : %s" % SERIAL_PORT)
+    print("Menggunakan ARIA_BIN    : %s" % ARIA_BIN)
+    print("Menggunakan ARIA_PYTHON : %s" % ARIA_PYTHON)
+    print("-" * 50)
     read_aria_sensors(port=SERIAL_PORT)
