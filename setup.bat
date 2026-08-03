@@ -1,9 +1,31 @@
 @echo off
-setlocal
-:: === KONFIGURASI ===
-set VENV_DIR=.venv
-set WHEELS_DIR=.\wheels
-set PYTHON27_PATH=C:\Python27-32\python.exe
+setlocal enableextensions enabledelayedexpansion
+
+:: === LOAD CONFIGURATION FROM .ENV ===
+if not exist .env (
+    echo [ERROR] File .env tidak ditemukan!
+    echo Harap buat file .env terlebih dahulu.
+    pause
+    exit /b 1
+)
+
+for /f "usebackq tokens=1* delims==" %%A in (".env") do (
+    :: Abaikan baris kosong dan baris komentar (dimulai dengan # atau rem)
+    set "line=%%A"
+    if defined line (
+        if not "!line:~0,1!"=="#" (
+            if /i not "!line:~0,3!"=="rem" (
+                set "%%A=%%B"
+            )
+        )
+    )
+)
+
+echo [INFO] Konfigurasi berhasil dimuat dari .env:
+echo  - VENV_DIR     : %VENV_DIR%
+echo  - WHEELS_DIR   : %WHEELS_DIR%
+echo  - PYTHON27_PATH: %PYTHON27_PATH%
+echo.
 
 echo [1/6] Menghapus existing venv dan wheels folder...
 if exist %VENV_DIR% (
