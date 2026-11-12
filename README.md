@@ -34,7 +34,7 @@ SERIAL_BAUDRATE=9600
 RABBITMQ_HOST=localhost
 RABBITMQ_QUEUE=control
 RABBITMQ_QUEUE_SENSOR=sensor
-RABBITMQ_PORT=5672
+RABBITMQ_WS_URL=wss://amqp.luminaire.software:443/ws
 RABBITMQ_USER=guest
 RABBITMQ_PASSWORD=guest
 RABBITMQ_VHOST=/
@@ -54,7 +54,7 @@ python -m pip install -r requirements.txt
 5. Jalankan konsumer kontrol:
 
 ```powershell
-python p3dx_control.py
+./run.sh
 ```
 
 6. Jalankan remote controller untuk mengirim perintah:

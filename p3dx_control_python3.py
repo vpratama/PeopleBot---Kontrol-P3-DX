@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import collections
-import collections.abc
-
-# Monkey-patch collections.Callable for older pika versions on Python 3.10+
-if not hasattr(collections, 'Callable'):
-    collections.Callable = collections.abc.Callable
-
 import json
 import os
 import platform
@@ -16,9 +9,11 @@ import serial
 import sys
 import threading
 import time
+
+import websocket
+import certifi
 import traceback
 from dotenv import load_dotenv
-import pika
 
 # Load environment variables from .env file
 load_dotenv()
@@ -30,6 +25,33 @@ VERBOSE = os.getenv('VERBOSE_SONAR', 'true').lower() in ('1', 'true', 'yes', 'on
 def hexdump(b: bytes | bytearray) -> str:
     """Return a hex string for bytes/bytearray."""
     return ' '.join(f'{x:02X}' for x in b)
+
+
+def _stomp_escape(value: str) -> str:
+    return value.replace('\\', '\\\\').replace('\r', '\\r').replace('\n', '\\n').replace(':', '\\c')
+
+
+def _stomp_connect(ws, user, password, vhost):
+    ws.send('CONNECT\naccept-version:1.2\nheart-beat:0,0\n'
+            f'host:{_stomp_escape(vhost)}\nlogin:{_stomp_escape(user)}\n'
+            f'passcode:{_stomp_escape(password)}\n\n\x00')
+    response = ws.recv()
+    if isinstance(response, bytes):
+        response = response.decode('utf-8', errors='replace')
+    if not response.startswith('CONNECTED\n'):
+        raise ConnectionError(f'Web STOMP connection failed: {response[:200]}')
+
+
+def _stomp_headers(frame):
+    lines = frame.split('\n')
+    headers = {}
+    for line in lines[1:]:
+        if not line:
+            break
+        key, sep, value = line.partition(':')
+        if sep:
+            headers[key] = value
+    return lines[0], headers, frame.split('\n\n', 1)[1] if '\n\n' in frame else ''
 
 
 # Platform-specific non-blocking keyboard input imports
@@ -49,9 +71,8 @@ class P3DXRobot:
         self.reader_thread = None
         self.reader_running = False
         
-        # RabbitMQ publisher setup & thread safety lock
+        # RabbitMQ Web STOMP publisher and thread safety lock
         self.rabbit_conn = None
-        self.rabbit_channel = None
         self.rabbit_queue = os.getenv('RABBITMQ_QUEUE_TERMINAL', 'terminal')
         self.rabbit_lock = threading.Lock()
 
@@ -139,17 +160,15 @@ class P3DXRobot:
             
         self.ser.close()
         
-        # Thread-safe RabbitMQ connection cleanup
+        # Thread-safe Web STOMP connection cleanup
         with self.rabbit_lock:
             try:
-                if self.rabbit_channel and self.rabbit_channel.is_open:
-                    self.rabbit_channel.close()
-                if self.rabbit_conn and self.rabbit_conn.is_open:
+                if self.rabbit_conn:
+                    self.rabbit_conn.send('DISCONNECT\n\n\x00')
                     self.rabbit_conn.close()
             except Exception:
                 pass
             finally:
-                self.rabbit_channel = None
                 self.rabbit_conn = None
 
     def start_reader(self):
@@ -176,56 +195,43 @@ class P3DXRobot:
         self.reader_thread.start()
 
     def _init_rabbit_publisher(self):
-        """Initialize RabbitMQ connection and channel."""
-        host = os.getenv('RABBITMQ_HOST', 'localhost')
-        port = int(os.getenv('RABBITMQ_PORT', '5672'))
+        """Initialize a RabbitMQ Web STOMP connection."""
+        url = os.getenv('RABBITMQ_WS_URL', 'ws://localhost:15674/ws')
         user = os.getenv('RABBITMQ_USER', 'guest')
         password = os.getenv('RABBITMQ_PASSWORD', 'guest')
         vhost = os.getenv('RABBITMQ_VHOST', '/')
         queue = os.getenv('RABBITMQ_QUEUE_TERMINAL', self.rabbit_queue)
-        
         if self.rabbit_conn:
-            try:
-                self.rabbit_conn.close()
-            except Exception:
-                pass
+            try: self.rabbit_conn.close()
+            except Exception: pass
             self.rabbit_conn = None
-            self.rabbit_channel = None
-
         try:
-            credentials = pika.PlainCredentials(user, password)
-            params = pika.ConnectionParameters(
-                host=host, port=port, virtual_host=vhost, credentials=credentials
-            )
-            conn = pika.BlockingConnection(params)
-            ch = conn.channel()
-            ch.queue_declare(queue=queue, durable=True, auto_delete=False)
+            conn = websocket.create_connection(url, timeout=5, subprotocols=['v12.stomp'], sslopt={'ca_certs': certifi.where()})
+            _stomp_connect(conn, user, password, vhost)
             self.rabbit_conn = conn
-            self.rabbit_channel = ch
             self.rabbit_queue = queue
         except Exception as e:
-            print(f"RabbitMQ publisher init failed: {e}")
+            print(f"RabbitMQ Web STOMP publisher init failed: {e}")
 
     def _publish_terminal_event(self, direction: str, data: bytes | bytearray):
-        if not self.rabbit_channel:
+        if not self.rabbit_conn:
             self._init_rabbit_publisher()
-        if not self.rabbit_channel:
+        if not self.rabbit_conn:
             return
-
-        payload = {
-            'time': time.time(),
-            'dir': direction,
-            'hex': hexdump(data),
-            'text': data.decode('utf-8', errors='ignore'),
-        }
-        body = json.dumps(payload).encode('utf-8')
+        payload = {'time': time.time(), 'dir': direction, 'hex': hexdump(data),
+                   'text': data.decode('utf-8', errors='ignore')}
         try:
             with self.rabbit_lock:
-                self.rabbit_channel.basic_publish(
-                    exchange='', routing_key=self.rabbit_queue, body=body
+                self.rabbit_conn.send(
+                    f'SEND\ndestination:/amq/queue/{self.rabbit_queue}'
+                    f'\ncontent-type:application/json\n\n{json.dumps(payload)}\x00'
                 )
         except Exception as e:
             print(f"Terminal publish error: {e}")
+            with self.rabbit_lock:
+                try: self.rabbit_conn.close()
+                except Exception: pass
+                self.rabbit_conn = None
 
 
 def get_key_nonblocking():
@@ -234,8 +240,18 @@ def get_key_nonblocking():
             return msvcrt.getch().decode('utf-8', errors='ignore')
         return None
 
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
+    # No controlling terminal (e.g. running as a boot service): no key input.
+    try:
+        if sys.stdin is None or not sys.stdin.isatty():
+            return None
+    except (ValueError, OSError):
+        return None
+
+    try:
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+    except (termios.error, ValueError, OSError):
+        return None
     try:
         tty.setraw(fd)
         if select.select([sys.stdin], [], [], 0)[0]:
@@ -248,8 +264,7 @@ def get_key_nonblocking():
 def main():
     serial_port = os.getenv('SERIAL_PORT', '/dev/ttyUSB0')
     serial_baudrate = int(os.getenv('SERIAL_BAUDRATE', '9600'))
-    rabbitmq_host = os.getenv('RABBITMQ_HOST', 'localhost')
-    rabbitmq_port = int(os.getenv('RABBITMQ_PORT', '5672'))
+    rabbitmq_ws_url = os.getenv('RABBITMQ_WS_URL', 'ws://localhost:15674/ws')
     rabbitmq_user = os.getenv('RABBITMQ_USER', 'guest')
     rabbitmq_password = os.getenv('RABBITMQ_PASSWORD', 'guest')
     rabbitmq_queue = os.getenv('RABBITMQ_QUEUE', 'robot_control')
@@ -261,45 +276,51 @@ def main():
         robot.connect()
         print("\nP3-DX RabbitMQ Control Started")
         print(f"Serial Port: {serial_port} @ {serial_baudrate} baud")
-        print(f"RabbitMQ Host: {rabbitmq_host}:{rabbitmq_port}")
+        print(f"RabbitMQ Web STOMP: {rabbitmq_ws_url}")
         print("Press Z to quit\n")
 
         def rabbitmq_consumer():
             try:
-                credentials = pika.PlainCredentials(rabbitmq_user, rabbitmq_password)
-                connection = pika.BlockingConnection(pika.ConnectionParameters(
-                    host=rabbitmq_host, port=rabbitmq_port,
-                    virtual_host=rabbitmq_vhost, credentials=credentials
-                ))
-                channel = connection.channel()
-                channel.queue_declare(queue=rabbitmq_queue, durable=True, auto_delete=False)
-
-                def callback(ch, method, properties, body):
+                ws = websocket.create_connection(
+                    rabbitmq_ws_url, timeout=5, subprotocols=['v12.stomp'], sslopt={'ca_certs': certifi.where()}
+                )
+                _stomp_connect(ws, rabbitmq_user, rabbitmq_password, rabbitmq_vhost)
+                ws.settimeout(1)
+                ws.send(
+                    f'SUBSCRIBE\nid:peoplebot-control\ndestination:/amq/queue/{rabbitmq_queue}'
+                    '\nack:auto\n\n\x00'
+                )
+                print(f'Subscribed to RabbitMQ Web STOMP queue: {rabbitmq_queue}', flush=True)
+                buffer = ''
+                while not state['should_quit']:
                     try:
-                        message = body.decode('utf-8').strip()
-                        values = message.split(',')
-                        if len(values) == 2:
-                            state['left'] = int(values[0])
-                            state['right'] = int(values[1])
-                    except (ValueError, UnicodeDecodeError) as e:
-                        print(f"Error parsing message: {e}")
-                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                        chunk = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    if not chunk:
+                        raise ConnectionError('Web STOMP connection closed')
+                    if isinstance(chunk, bytes):
+                        chunk = chunk.decode('utf-8', errors='replace')
+                    buffer += chunk
+                    while '\x00' in buffer:
+                        frame, buffer = buffer.split('\x00', 1)
+                        if not frame.strip():
+                            continue
+                        command, headers, body = _stomp_headers(frame)
+                        if command == 'MESSAGE':
+                            try:
+                                values = body.strip().split(',')
+                                if len(values) == 2:
+                                    state['left'], state['right'] = map(int, values)
+                            except ValueError as e:
+                                print(f"Error parsing message: {e}")
+                        elif command == 'ERROR':
+                            raise ConnectionError(f"Web STOMP broker error: {body.strip()}")
+                ws.send('DISCONNECT\n\n\x00')
+                ws.close()
 
-                try:
-                    channel.basic_consume(
-                        queue=rabbitmq_queue,
-                        on_message_callback=callback,
-                        auto_ack=False
-                    )
-                except TypeError:
-                    channel.basic_consume(
-                        callback,
-                        queue=rabbitmq_queue,
-                        no_ack=False
-                    )
-                channel.start_consuming()
             except Exception as e:
-                print(f"RabbitMQ Error: {e}")
+                print(f"RabbitMQ Web STOMP Error: {e}")
                 state['should_quit'] = True
 
         def watchdog():

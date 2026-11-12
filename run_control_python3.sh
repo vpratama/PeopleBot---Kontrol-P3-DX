@@ -3,6 +3,13 @@
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
+# --- single-instance lock (prevents duplicate motor-control processes) ---
+exec 9>"/tmp/peoplebot-control.lock"
+if ! flock -n 9; then
+    echo "ERROR: peoplebot control is already running."
+    exit 1
+fi
+
 # === LOAD CONFIGURATION FROM .ENV ===
 if [ ! -f .env ]; then
     echo "ERROR: File .env tidak ditemukan!"
