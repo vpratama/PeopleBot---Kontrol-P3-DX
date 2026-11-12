@@ -1,5 +1,8 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
 # === LOAD CONFIGURATION FROM .ENV ===
 if [ ! -f .env ]; then
     echo "ERROR: File .env tidak ditemukan!"
@@ -29,6 +32,7 @@ if [ ! -f "${VENV_DIR}/bin/activate" ]; then
 fi
 
 source "${VENV_DIR}/bin/activate"
+echo "Using Python: $(command -v python)"
 
 echo "[2/2] Running p3dx_control.py..."
 if [ ! -f p3dx_control.py ]; then
@@ -37,7 +41,7 @@ if [ ! -f p3dx_control.py ]; then
     exit 1
 fi
 
-python p3dx_control.py
+python "$SCRIPT_DIR/p3dx_control.py"
 
 echo
 echo "Program exited."

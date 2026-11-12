@@ -1,5 +1,8 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
 # === LOAD CONFIGURATION FROM .ENV ===
 if [ ! -f .env ]; then
     echo "ERROR: File .env tidak ditemukan!"
@@ -53,7 +56,7 @@ if ! "${PYTHON_BIN}" -c 'import serial' 2>/dev/null; then
     exit 1
 fi
 
-"${PYTHON_BIN}" p3dx_control_python3.py
+"${PYTHON_BIN}" "$SCRIPT_DIR/p3dx_control_python3.py"
 
 echo
 echo "Program exited."
