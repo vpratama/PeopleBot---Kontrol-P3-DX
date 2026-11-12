@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function
 
-import serial
 import time
 import sys
 import threading
@@ -36,6 +35,8 @@ else:
 
 class P3DXRobot:
     def __init__(self, port='/dev/ttyUSB0', baudrate=9600):
+        import serial
+
         self.ser = serial.Serial(port, baudrate, timeout=0.1)
         self.lock = threading.Lock()
         self.running = True
@@ -327,8 +328,10 @@ def main():
     rabbitmq_password = os.getenv('RABBITMQ_PASSWORD', 'guest')
     rabbitmq_queue = os.getenv('RABBITMQ_QUEUE', 'robot_control')
     rabbitmq_vhost = os.getenv('RABBITMQ_VHOST', '/')
-
-    robot = P3DXRobot(port=serial_port, baudrate=serial_baudrate)
+    serial_simulation = os.getenv('SERIAL_SIMULATION', 'false').strip().lower() in (
+        '1', 'true', 'yes', 'on'
+    )
+    robot = None
 
     # Use dict instead of nonlocal (Python 2.7 compatible)
     state = {
@@ -338,10 +341,15 @@ def main():
     }
 
     try:
-        robot.connect()
+        if serial_simulation:
+            print("SERIAL_SIMULATION=true: serial is disabled; RabbitMQ messages will be printed.")
+        else:
+            robot = P3DXRobot(port=serial_port, baudrate=serial_baudrate)
+            robot.connect()
 
         print("\nP3-DX RabbitMQ Control Started")
-        print("Serial Port: {} @ {} baud".format(serial_port, serial_baudrate))
+        if robot is not None:
+            print("Serial Port: {} @ {} baud".format(serial_port, serial_baudrate))
         print("RabbitMQ Host: {}:{}".format(rabbitmq_host, rabbitmq_port))
         print("RabbitMQ Virtual Host: {}".format(rabbitmq_vhost))
         print("RabbitMQ Queue: {}".format(rabbitmq_queue))
@@ -377,13 +385,13 @@ def main():
                                         message = message.decode('utf-8')
                                 except Exception:
                                     pass
-                        values = message.split(',')
-                        if len(values) == 2:
-                            state['left'] = int(values[0])
-                            state['right'] = int(values[1])
-                            sys.stdout.write("\rReceived: Left={} mm/s, Right={} mm/s ".format(
-                                state['left'], state['right']))
-                            sys.stdout.flush()
+                        print('[RABBITMQ] Received: {}'.format(message))
+                        sys.stdout.flush()
+                        if not serial_simulation:
+                            values = message.split(',')
+                            if len(values) == 2:
+                                state['left'] = int(values[0])
+                                state['right'] = int(values[1])
                     except Exception as e:
                         print("Error parsing message: {}".format(e))
 
@@ -467,7 +475,7 @@ def main():
                         print('Terminal consumer error: {}'.format(e))
 
         def watchdog():
-            while robot.running and not state['should_quit']:
+            while robot is not None and robot.running and not state['should_quit']:
                 robot.pulse()
                 time.sleep(1.0)
 
@@ -475,32 +483,34 @@ def main():
         consumer_thread.daemon = True
         consumer_thread.start()
 
-        watchdog_thread = threading.Thread(target=watchdog)
-        watchdog_thread.daemon = True
-        watchdog_thread.start()
+        if robot is not None:
+            watchdog_thread = threading.Thread(target=watchdog)
+            watchdog_thread.daemon = True
+            watchdog_thread.start()
 
         while not state['should_quit']:
-            left_motor_vel = state['left']
-            right_motor_vel = state['right']
-
-            if left_motor_vel == right_motor_vel:
-                linear_vel = left_motor_vel
-                angular_vel = 0
-            else:
-                linear_vel = 0
-                angular_vel = (right_motor_vel - left_motor_vel) // 2
-
             key = get_key_nonblocking()
             if key is not None and key.lower() == 'z':
                 print("\nShutdown requested by user...")
                 state['should_quit'] = True
                 break
 
-            if linear_vel!= 0 or angular_vel!= 0:
-                robot.set_velocity(linear_vel)
-                robot.set_rot_velocity(angular_vel)
-            else:
-                robot.stop()
+            if robot is not None:
+                left_motor_vel = state['left']
+                right_motor_vel = state['right']
+
+                if left_motor_vel == right_motor_vel:
+                    linear_vel = left_motor_vel
+                    angular_vel = 0
+                else:
+                    linear_vel = 0
+                    angular_vel = (right_motor_vel - left_motor_vel) // 2
+
+                if linear_vel != 0 or angular_vel != 0:
+                    robot.set_velocity(linear_vel)
+                    robot.set_rot_velocity(angular_vel)
+                else:
+                    robot.stop()
 
             time.sleep(0.05)
 
@@ -510,8 +520,11 @@ def main():
         print("\nError: {}".format(e))
     finally:
         state['should_quit'] = True
-        robot.disconnect()
-        print("Disconnected.")
+        if robot is not None:
+            robot.disconnect()
+            print("Disconnected.")
+        else:
+            print("Simulation ended.")
 
 if __name__ == "__main__":
     main()

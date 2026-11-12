@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+from __future__ import annotations
 
 import json
 import os
 import platform
 import select
-import serial
 import sys
 import threading
 import time
@@ -38,20 +38,23 @@ def _stomp_connect(ws, user, password, vhost):
     response = ws.recv()
     if isinstance(response, bytes):
         response = response.decode('utf-8', errors='replace')
+    response = response.replace('\r\n', '\n')
     if not response.startswith('CONNECTED\n'):
         raise ConnectionError(f'Web STOMP connection failed: {response[:200]}')
 
 
 def _stomp_headers(frame):
+    # STOMP heartbeats are bare line feeds and may appear between frames.
+    frame = frame.replace('\r\n', '\n').lstrip('\r\n')
     lines = frame.split('\n')
     headers = {}
     for line in lines[1:]:
-        if not line:
+        if not line.strip():
             break
         key, sep, value = line.partition(':')
         if sep:
             headers[key] = value
-    return lines[0], headers, frame.split('\n\n', 1)[1] if '\n\n' in frame else ''
+    return lines[0].strip(), headers, frame.split('\n\n', 1)[1] if '\n\n' in frame else ''
 
 
 # Platform-specific non-blocking keyboard input imports
@@ -64,6 +67,8 @@ else:
 
 class P3DXRobot:
     def __init__(self, port='/dev/ttyUSB0', baudrate=9600):
+        import serial
+
         self.ser = serial.Serial(port, baudrate, timeout=0.1)
         self.lock = threading.Lock()
         self.running = True
@@ -269,86 +274,135 @@ def main():
     rabbitmq_password = os.getenv('RABBITMQ_PASSWORD', 'guest')
     rabbitmq_queue = os.getenv('RABBITMQ_QUEUE', 'robot_control')
     rabbitmq_vhost = os.getenv('RABBITMQ_VHOST', '/')
-    robot = P3DXRobot(port=serial_port, baudrate=serial_baudrate)
+    serial_simulation = os.getenv('SERIAL_SIMULATION', 'false').strip().lower() in (
+        '1', 'true', 'yes', 'on'
+    )
+    robot = None
     state = {'left': 0, 'right': 0, 'should_quit': False}
 
     try:
-        robot.connect()
+        if serial_simulation:
+            print(
+                'SERIAL_SIMULATION=true: serial is disabled; '
+                'RabbitMQ messages will be printed.',
+                flush=True,
+            )
+        else:
+            robot = P3DXRobot(port=serial_port, baudrate=serial_baudrate)
+            robot.connect()
+
         print("\nP3-DX RabbitMQ Control Started")
-        print(f"Serial Port: {serial_port} @ {serial_baudrate} baud")
+        if robot is not None:
+            print(f"Serial Port: {serial_port} @ {serial_baudrate} baud")
         print(f"RabbitMQ Web STOMP: {rabbitmq_ws_url}")
         print("Press Z to quit\n")
 
         def rabbitmq_consumer():
-            try:
-                ws = websocket.create_connection(
-                    rabbitmq_ws_url, timeout=5, subprotocols=['v12.stomp'], sslopt={'ca_certs': certifi.where()}
-                )
-                _stomp_connect(ws, rabbitmq_user, rabbitmq_password, rabbitmq_vhost)
-                ws.settimeout(1)
-                ws.send(
-                    f'SUBSCRIBE\nid:peoplebot-control\ndestination:/amq/queue/{rabbitmq_queue}'
-                    '\nack:auto\n\n\x00'
-                )
-                print(f'Subscribed to RabbitMQ Web STOMP queue: {rabbitmq_queue}', flush=True)
-                buffer = ''
-                while not state['should_quit']:
-                    try:
-                        chunk = ws.recv()
-                    except websocket.WebSocketTimeoutException:
-                        continue
-                    if not chunk:
-                        raise ConnectionError('Web STOMP connection closed')
-                    if isinstance(chunk, bytes):
-                        chunk = chunk.decode('utf-8', errors='replace')
-                    buffer += chunk
-                    while '\x00' in buffer:
-                        frame, buffer = buffer.split('\x00', 1)
-                        if not frame.strip():
-                            continue
-                        command, headers, body = _stomp_headers(frame)
-                        if command == 'MESSAGE':
-                            try:
-                                values = body.strip().split(',')
-                                if len(values) == 2:
-                                    state['left'], state['right'] = map(int, values)
-                            except ValueError as e:
-                                print(f"Error parsing message: {e}")
-                        elif command == 'ERROR':
-                            raise ConnectionError(f"Web STOMP broker error: {body.strip()}")
-                ws.send('DISCONNECT\n\n\x00')
-                ws.close()
+            announced_subscription = False
+            while not state['should_quit']:
+                ws = None
+                try:
+                    ws = websocket.create_connection(
+                        rabbitmq_ws_url,
+                        timeout=5,
+                        subprotocols=['v12.stomp'],
+                        sslopt={'ca_certs': certifi.where()},
+                    )
+                    _stomp_connect(ws, rabbitmq_user, rabbitmq_password, rabbitmq_vhost)
+                    ws.settimeout(1)
+                    ws.send(
+                        f'SUBSCRIBE\nid:peoplebot-control\ndestination:/amq/queue/{rabbitmq_queue}'
+                        '\nack:auto\n\n\x00'
+                    )
+                    if not announced_subscription:
+                        print(
+                            f'Subscribed to RabbitMQ Web STOMP queue: {rabbitmq_queue}',
+                            flush=True,
+                        )
+                        announced_subscription = True
 
-            except Exception as e:
-                print(f"RabbitMQ Web STOMP Error: {e}")
-                state['should_quit'] = True
+                    buffer = ''
+                    while not state['should_quit']:
+                        try:
+                            chunk = ws.recv()
+                        except websocket.WebSocketTimeoutException:
+                            continue
+                        if not chunk:
+                            raise ConnectionError('Web STOMP connection closed')
+                        if isinstance(chunk, bytes):
+                            chunk = chunk.decode('utf-8', errors='replace')
+                        buffer += chunk
+                        while '\x00' in buffer:
+                            frame, buffer = buffer.split('\x00', 1)
+                            if not frame.strip():
+                                continue
+                            command, headers, body = _stomp_headers(frame)
+                            if command == 'MESSAGE':
+                                message = body.rstrip('\r\n')
+                                print(f'[RABBITMQ] Received: {message}', flush=True)
+                                if serial_simulation:
+                                    continue
+                                try:
+                                    values = message.split(',')
+                                    if len(values) == 2:
+                                        state['left'], state['right'] = map(int, values)
+                                except ValueError as e:
+                                    print(f"Error parsing message: {e}")
+                            elif command == 'ERROR':
+                                raise ConnectionError(
+                                    f"Web STOMP broker error: {body.strip()}"
+                                )
+
+                    if state['should_quit']:
+                        try:
+                            ws.send('DISCONNECT\n\n\x00')
+                        except Exception:
+                            pass
+                        break
+                except Exception as e:
+                    # Keep the main control loop running and report reconnect issues.
+                    if not state['should_quit']:
+                        print(
+                            f'RabbitMQ Web STOMP error: {e}; retrying in 2 seconds.',
+                            flush=True,
+                        )
+                        time.sleep(2)
+                finally:
+                    if ws is not None:
+                        try:
+                            ws.close()
+                        except Exception:
+                            pass
 
         def watchdog():
-            while robot.running and not state['should_quit']:
+            while robot is not None and robot.running and not state['should_quit']:
                 robot.pulse()
                 time.sleep(1.0)
 
         threading.Thread(target=rabbitmq_consumer, daemon=True).start()
-        threading.Thread(target=watchdog, daemon=True).start()
+        if robot is not None:
+            threading.Thread(target=watchdog, daemon=True).start()
 
         while not state['should_quit']:
-            left_motor_vel = state['left']
-            right_motor_vel = state['right']
-            if left_motor_vel == right_motor_vel:
-                linear_vel, angular_vel = left_motor_vel, 0
-            else:
-                linear_vel = 0
-                angular_vel = (right_motor_vel - left_motor_vel) // 2
-
             key = get_key_nonblocking()
             if key is not None and key.lower() == 'z':
                 state['should_quit'] = True
                 break
-            if linear_vel or angular_vel:
-                robot.set_velocity(linear_vel)
-                robot.set_rot_velocity(angular_vel)
-            else:
-                robot.stop()
+
+            if robot is not None:
+                left_motor_vel = state['left']
+                right_motor_vel = state['right']
+                if left_motor_vel == right_motor_vel:
+                    linear_vel, angular_vel = left_motor_vel, 0
+                else:
+                    linear_vel = 0
+                    angular_vel = (right_motor_vel - left_motor_vel) // 2
+
+                if linear_vel or angular_vel:
+                    robot.set_velocity(linear_vel)
+                    robot.set_rot_velocity(angular_vel)
+                else:
+                    robot.stop()
             time.sleep(0.05)
     except KeyboardInterrupt:
         print("\nShutdown requested...")
@@ -356,8 +410,11 @@ def main():
         print(f"\nError: {e}")
     finally:
         state['should_quit'] = True
-        robot.disconnect()
-        print("Disconnected.")
+        if robot is not None:
+            robot.disconnect()
+            print("Disconnected.")
+        else:
+            print("Simulation ended.")
 
 
 if __name__ == "__main__":
