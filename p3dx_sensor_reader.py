@@ -1,10 +1,12 @@
 
 import os
 import re
-import pika
+import paho.mqtt.client as mqtt
 import serial
 import time
 import random
+import threading
+import certifi
 from dotenv import load_dotenv
 
 # Muat variabel lingkungan dari file .env
@@ -16,13 +18,13 @@ SERIAL_PORT = os.getenv('SERIAL_PORT', '/dev/ttyUSB0')
 SERIAL_BAUDRATE = int(os.getenv('SERIAL_BAUDRATE', '9600'))
 SENSOR_SIMULATION = os.getenv('SENSOR_SIMULATION', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
 
-# --- Konfigurasi RabbitMQ ---
-RABBITMQ_HOST = os.getenv('RABBITMQ_HOST', 'localhost')
-RABBITMQ_PORT = int(os.getenv('RABBITMQ_PORT', '5672'))
+# --- Konfigurasi RabbitMQ Web MQTT ---
+RABBITMQ_MQTT_HOST = os.getenv('RABBITMQ_MQTT_HOST', 'mqtt.luminaire.software')
+RABBITMQ_MQTT_PORT = int(os.getenv('RABBITMQ_MQTT_PORT', '443'))
+RABBITMQ_MQTT_PATH = os.getenv('RABBITMQ_MQTT_PATH', '/ws')
+RABBITMQ_MQTT_TOPIC = os.getenv('RABBITMQ_MQTT_TOPIC', 'sensor')
 RABBITMQ_USER = os.getenv('RABBITMQ_USER', 'guest')
 RABBITMQ_PASSWORD = os.getenv('RABBITMQ_PASSWORD', 'guest')
-RABBITMQ_VHOST = os.getenv('RABBITMQ_VHOST', '/')
-RABBITMQ_QUEUE_SENSOR = os.getenv('RABBITMQ_QUEUE_SENSOR', 'sensor')
 
 # --- Simulasi Data Sonar ---
 # Pioneer P3-DX biasanya memiliki 8 atau 16 sensor sonar. Kita akan simulasikan 8 sensor.
@@ -94,45 +96,61 @@ def display_sonar_data(sonar_readings):
 
 
 def connect_rabbitmq():
-    """Membuka koneksi RabbitMQ berdasarkan konfigurasi dari .env."""
-    credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASSWORD)
-    connection = pika.BlockingConnection(
-        pika.ConnectionParameters(
-            host=RABBITMQ_HOST,
-            port=RABBITMQ_PORT,
-            virtual_host=RABBITMQ_VHOST,
-            credentials=credentials
-        )
+    """Connect to RabbitMQ Web MQTT over a TLS WebSocket."""
+    connected = threading.Event()
+    result = {'rc': None}
+    client = mqtt.Client(transport='websockets')
+
+    def _on_connect(_client, _userdata, _flags, rc):
+        result['rc'] = rc
+        connected.set()
+
+    client.on_connect = _on_connect
+    client.username_pw_set(RABBITMQ_USER, RABBITMQ_PASSWORD)
+    client.ws_set_options(path=RABBITMQ_MQTT_PATH)
+    client.tls_set(ca_certs=certifi.where())
+    client.connect(RABBITMQ_MQTT_HOST, RABBITMQ_MQTT_PORT, keepalive=60)
+    client.loop_start()
+
+    if not connected.wait(timeout=10):
+        client.disconnect()
+        client.loop_stop()
+        raise TimeoutError('Timed out waiting for the RabbitMQ MQTT connection.')
+    if result['rc'] != 0:
+        client.disconnect()
+        client.loop_stop()
+        raise ConnectionError(f'RabbitMQ MQTT connection was rejected (code {result["rc"]}).')
+
+    print(
+        f'[MQTT] Connected to wss://{RABBITMQ_MQTT_HOST}:{RABBITMQ_MQTT_PORT}'
+        f'{RABBITMQ_MQTT_PATH}; topic={RABBITMQ_MQTT_TOPIC}',
+        flush=True,
     )
-    channel = connection.channel()
-    channel.queue_declare(queue=RABBITMQ_QUEUE_SENSOR, durable=True, auto_delete=False)
-    print(f"[RABBITMQ] Terhubung ke {RABBITMQ_HOST}:{RABBITMQ_PORT} vhost={RABBITMQ_VHOST} queue={RABBITMQ_QUEUE_SENSOR}")
-    return connection, channel
+    return client
 
 
-def publish_sensor_data(channel, sonar_readings):
-    """Mengirim data sensor ke queue RabbitMQ dalam format S1,S2,...,S8."""
+def publish_sensor_data(client, sonar_readings):
+    """Publish sensor readings to the MQTT topic in S1,S2,...,S8 format."""
     if not sonar_readings:
         return
 
     payload = ','.join(map(str, sonar_readings))
-    channel.basic_publish(
-        exchange='',
-        routing_key=RABBITMQ_QUEUE_SENSOR,
-        body=payload,
-        properties=pika.BasicProperties(delivery_mode=2)
-    )
-    print(f"[RABBITMQ] Data sensor terkirim ke queue '{RABBITMQ_QUEUE_SENSOR}': {payload}")
+    message = client.publish(RABBITMQ_MQTT_TOPIC, payload, qos=1)
+    if message.rc != mqtt.MQTT_ERR_SUCCESS:
+        raise RuntimeError(f'Failed to publish MQTT sensor data: {mqtt.error_string(message.rc)}')
+    message.wait_for_publish(timeout=10)
+    if not message.is_published():
+        raise TimeoutError('Timed out waiting for the MQTT sensor message to be delivered.')
+    print(f"[MQTT] Data sensor terkirim ke topic '{RABBITMQ_MQTT_TOPIC}': {payload}", flush=True)
 
 
 def main():
     print(f"Mencoba membuka port serial: {SERIAL_PORT} dengan baud rate: {SERIAL_BAUDRATE}")
-    connection = None
-    channel = None
+    mqtt_client = None
     ser = None
 
     try:
-        connection, channel = connect_rabbitmq()
+        mqtt_client = connect_rabbitmq()
 
         if not SENSOR_SIMULATION:
             ser = serial.Serial(SERIAL_PORT, SERIAL_BAUDRATE, timeout=1)
@@ -157,7 +175,7 @@ def main():
             sonar_readings = parse_sip_packet(raw_data)
             if sonar_readings is not None:
                 display_sonar_data(sonar_readings)
-                publish_sensor_data(channel, sonar_readings)
+                publish_sensor_data(mqtt_client, sonar_readings)
             time.sleep(1) # Tunggu 1 detik sebelum pembacaan berikutnya
 
     except serial.SerialException as e:
@@ -169,9 +187,10 @@ def main():
     except Exception as e:
         print(f"[ERROR] Terjadi kesalahan tak terduga: {e}")
     finally:
-        if connection and connection.is_open:
-            connection.close()
-            print("[RABBITMQ] Koneksi ditutup.")
+        if mqtt_client is not None:
+            mqtt_client.disconnect()
+            mqtt_client.loop_stop()
+            print("[MQTT] Koneksi ditutup.")
 
         if ser is not None and ser.is_open:
             ser.close()

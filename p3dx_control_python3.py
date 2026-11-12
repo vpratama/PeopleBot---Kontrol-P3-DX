@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import platform
+import random
+import re
 import select
 import sys
 import threading
@@ -13,6 +15,7 @@ import time
 import websocket
 import certifi
 import traceback
+import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -57,6 +60,96 @@ def _stomp_headers(frame):
     return lines[0].strip(), headers, frame.split('\n\n', 1)[1] if '\n\n' in frame else ''
 
 
+def parse_sensor_readings(raw_data):
+    """Parse one comma-separated line containing eight sensor values."""
+    if isinstance(raw_data, (bytes, bytearray)):
+        try:
+            raw_data = raw_data.decode('ascii')
+        except UnicodeDecodeError:
+            return None
+
+    fields = str(raw_data).strip().split(',')
+    if len(fields) != 8:
+        return None
+    try:
+        return [int(float(value.strip())) for value in fields]
+    except ValueError:
+        return None
+
+
+class SensorMqttPublisher:
+    """Publish sensor CSV payloads to the RabbitMQ Web MQTT endpoint."""
+
+    def __init__(self):
+        self.host = os.getenv('RABBITMQ_MQTT_HOST', 'mqtt.luminaire.software')
+        self.port = int(os.getenv('RABBITMQ_MQTT_PORT', '443'))
+        self.path = os.getenv('RABBITMQ_MQTT_PATH', '/ws')
+        self.topic = os.getenv('RABBITMQ_MQTT_TOPIC', 'sensor')
+        self.client = mqtt.Client(
+            client_id=f'peoplebot-control-{os.getpid()}',
+            transport='websockets',
+        )
+        self.connected = threading.Event()
+        self.connect_result = {'rc': None}
+
+        def _on_connect(_client, _userdata, _flags, rc):
+            self.connect_result['rc'] = rc
+            self.connected.set()
+
+        self.client.on_connect = _on_connect
+        self.client.username_pw_set(
+            os.getenv('RABBITMQ_USER', 'guest'),
+            os.getenv('RABBITMQ_PASSWORD', 'guest'),
+        )
+        self.client.ws_set_options(path=self.path)
+        self.client.tls_set(ca_certs=certifi.where())
+        self.client.connect(self.host, self.port, keepalive=60)
+        self.client.loop_start()
+
+        if not self.connected.wait(timeout=10):
+            self.close()
+            raise TimeoutError('Timed out waiting for the RabbitMQ MQTT connection.')
+        if self.connect_result['rc'] != 0:
+            result = self.connect_result['rc']
+            self.close()
+            raise ConnectionError(f'RabbitMQ MQTT connection was rejected (code {result}).')
+
+        print(
+            f'[MQTT] Connected to wss://{self.host}:{self.port}{self.path}; topic={self.topic}',
+            flush=True,
+        )
+
+    def publish(self, readings, wait_for_delivery=True):
+        payload = ','.join(map(str, readings))
+        message = self.client.publish(self.topic, payload, qos=1)
+        if message.rc != mqtt.MQTT_ERR_SUCCESS:
+            print(f'[MQTT] Publish failed: {mqtt.error_string(message.rc)}', flush=True)
+            return
+        if wait_for_delivery:
+            try:
+                message.wait_for_publish(timeout=5)
+            except (RuntimeError, ValueError) as e:
+                print(f'[MQTT] Publish failed: {e}', flush=True)
+                return
+            if not message.is_published():
+                print('[MQTT] Timed out waiting for publish confirmation.', flush=True)
+                return
+            status = 'Published'
+        else:
+            status = 'Queued'
+        print(f"[MQTT] {status} to '{self.topic}': {payload}", flush=True)
+
+    def close(self):
+        try:
+            self.client.disconnect()
+        except Exception:
+            pass
+        try:
+            self.client.loop_stop()
+        except Exception:
+            pass
+
+
 # Platform-specific non-blocking keyboard input imports
 if platform.system() == "Windows":
     import msvcrt
@@ -66,10 +159,12 @@ else:
 
 
 class P3DXRobot:
-    def __init__(self, port='/dev/ttyUSB0', baudrate=9600):
+    def __init__(self, port='/dev/ttyUSB0', baudrate=9600, sensor_callback=None):
         import serial
 
         self.ser = serial.Serial(port, baudrate, timeout=0.1)
+        self.sensor_callback = sensor_callback
+        self.sensor_buffer = bytearray()
         self.lock = threading.Lock()
         self.running = True
         self.connected = False
@@ -190,6 +285,7 @@ class P3DXRobot:
                         data = self.ser.read(avail)
                         if data:
                             self._publish_terminal_event('recv', data)
+                            self._consume_sensor_data(data)
                     else:
                         time.sleep(0.05)
                 except Exception as e:
@@ -198,6 +294,30 @@ class P3DXRobot:
 
         self.reader_thread = threading.Thread(target=_reader, daemon=True)
         self.reader_thread.start()
+
+    def _consume_sensor_data(self, data: bytes | bytearray):
+        """Extract complete eight-value CSV sensor lines from serial input."""
+        if self.sensor_callback is None:
+            return
+
+        self.sensor_buffer.extend(data)
+        readings = parse_sensor_readings(self.sensor_buffer)
+        if readings is not None:
+            self.sensor_buffer.clear()
+            self.sensor_callback(readings)
+            return
+
+        while b'\n' in self.sensor_buffer:
+            line, _, remainder = self.sensor_buffer.partition(b'\n')
+            self.sensor_buffer = bytearray(remainder)
+            readings = parse_sensor_readings(line.rstrip(b'\r'))
+            if readings is not None:
+                self.sensor_callback(readings)
+
+        # Binary robot packets can contain arbitrary bytes; discard an
+        # incomplete/non-CSV sequence before the buffer grows without bound.
+        if len(self.sensor_buffer) > 4096:
+            self.sensor_buffer.clear()
 
     def _init_rabbit_publisher(self):
         """Initialize a RabbitMQ Web STOMP connection."""
@@ -266,6 +386,34 @@ def get_key_nonblocking():
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
+def _simulate_sensor_data(publisher, state):
+    while not state['should_quit']:
+        readings = [random.randint(150, 5000) for _ in range(8)]
+        publisher.publish(readings)
+        for _ in range(10):
+            if state['should_quit']:
+                return
+            time.sleep(0.1)
+
+
+def _read_sensor_serial(port, baudrate, publisher, state):
+    try:
+        import serial
+
+        with serial.Serial(port, baudrate, timeout=1) as sensor_ser:
+            print(f'[SENSOR] Reading CSV data from {port}', flush=True)
+            while not state['should_quit']:
+                raw_data = sensor_ser.readline()
+                if not raw_data:
+                    continue
+                readings = parse_sensor_readings(raw_data)
+                if readings is not None:
+                    publisher.publish(readings)
+    except Exception as e:
+        if not state['should_quit']:
+            print(f'[SENSOR] Serial reader error on {port}: {e}', flush=True)
+
+
 def main():
     serial_port = os.getenv('SERIAL_PORT', '/dev/ttyUSB0')
     serial_baudrate = int(os.getenv('SERIAL_BAUDRATE', '9600'))
@@ -277,10 +425,19 @@ def main():
     serial_simulation = os.getenv('SERIAL_SIMULATION', 'false').strip().lower() in (
         '1', 'true', 'yes', 'on'
     )
+    sensor_simulation = os.getenv('SENSOR_SIMULATION', 'true').strip().lower() in (
+        '1', 'true', 'yes', 'on'
+    )
     robot = None
+    sensor_publisher = None
     state = {'left': 0, 'right': 0, 'should_quit': False}
 
     try:
+        try:
+            sensor_publisher = SensorMqttPublisher()
+        except Exception as e:
+            print(f'[MQTT] Sensor publisher unavailable: {e}', flush=True)
+
         if serial_simulation:
             print(
                 'SERIAL_SIMULATION=true: serial is disabled; '
@@ -288,7 +445,16 @@ def main():
                 flush=True,
             )
         else:
-            robot = P3DXRobot(port=serial_port, baudrate=serial_baudrate)
+            sensor_callback = None
+            if sensor_publisher is not None and not sensor_simulation:
+                sensor_callback = lambda readings: sensor_publisher.publish(
+                    readings, wait_for_delivery=False
+                )
+            robot = P3DXRobot(
+                port=serial_port,
+                baudrate=serial_baudrate,
+                sensor_callback=sensor_callback,
+            )
             robot.connect()
 
         print("\nP3-DX RabbitMQ Control Started")
@@ -380,6 +546,20 @@ def main():
                 time.sleep(1.0)
 
         threading.Thread(target=rabbitmq_consumer, daemon=True).start()
+        if sensor_publisher is not None:
+            if sensor_simulation:
+                print('[SENSOR] Publishing simulated readings to MQTT topic.', flush=True)
+                threading.Thread(
+                    target=_simulate_sensor_data,
+                    args=(sensor_publisher, state),
+                    daemon=True,
+                ).start()
+            elif robot is None:
+                threading.Thread(
+                    target=_read_sensor_serial,
+                    args=(serial_port, serial_baudrate, sensor_publisher, state),
+                    daemon=True,
+                ).start()
         if robot is not None:
             threading.Thread(target=watchdog, daemon=True).start()
 
@@ -415,6 +595,8 @@ def main():
             print("Disconnected.")
         else:
             print("Simulation ended.")
+        if sensor_publisher is not None:
+            sensor_publisher.close()
 
 
 if __name__ == "__main__":
